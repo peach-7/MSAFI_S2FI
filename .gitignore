@@ -45,3 +45,4 @@ Thumbs.db
 # 忽略 trained_modesl 内容但保留结构
 trained_modesl/*
 !trained_modesl/.gitkeep
+
