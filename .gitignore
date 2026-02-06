@@ -46,3 +46,6 @@ Thumbs.db
 trained_modesl/*
 !trained_modesl/.gitkeep
 
+# 忽略 trained_models_again 内容但保留结构
+trained_models_again/*
+!trained_models_again/.gitkeep

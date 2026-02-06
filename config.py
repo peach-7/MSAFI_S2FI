@@ -13,20 +13,21 @@ CONFIG = {
         "c3d": "trained_models/best_c3d_model.pth",
         "mc3d": "trained_models/best_mc3d_model.pth",
         "transformer": "trained_models/best_transformer_model.pth",
-        "mamba_official": "trained_models/best_mamba_official_model.pth"
+        "mamba_official": "trained_models/best_mamba_official_model.pth",
+        "transformer_based_on_i3d": "trained_models/best_transformer_based_on_i3d_model.pth"
     },
     "all_model_names": [
-        "r3d", "i3d", "c3d", "mc3d", "transformer", "mamba_official"
+        "r3d", "i3d", "c3d", "mc3d", "transformer", "mamba_official", "transformer_based_on_i3d"
     ],
     "num_classes": 3,
     "num_frames": 16,
     "input_size": 112,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "initial_batch_size": 8,  # 初始批量大小
+    "initial_batch_size": 8,  # 初始批量大小(8)
     "batch_size_increase_factor": 1.1,  # 批量大小增加因子
     "max_batch_size": 64,  # 最大批量大小
     "batch_size": 32,  # 验证和测试的批量大小
-    "num_workers": 4,
+    "num_workers": 4,#(4)
     "epochs": 100,
     "learning_rate": 0.001,
     "patience": 20,  # Early Stopping 的耐心值

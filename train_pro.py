@@ -1,30 +1,28 @@
-# train_again.py
+# train.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import torch.nn.functional as F
-import warnings
-import os
-import time
-import sys
-import re
-from sklearn.metrics import f1_score, classification_report
-import numpy as np
+from utils.data_processing import FruitVideoDataset
 from models.C3D import C3D
 from models.I3D import I3D
 from models.R3D import R3D
 from models.MC3D import MC3D
 from models.Transformer import Transformer
 from models.Mamba_official import Mamba_official
-from utils.data_processing import FruitVideoDataset
 from models.transformer_based_on_i3d import TransformerBasedOnI3D
+import warnings
+import os
+import time
+import sys
+import numpy as np
 
-# ===== 恢复为原始的 SuperAdaptiveCompositeLoss 类定义 (保证与旧模型兼容) =====
 warnings.filterwarnings('ignore')
 
 
+# ===== 修复：超级自适应复合损失函数 (SACL) =====
 class SuperAdaptiveCompositeLoss(nn.Module):
     """最强性能自适应损失函数 - SACL (Super Adaptive Composite Loss)"""
 
@@ -32,15 +30,22 @@ class SuperAdaptiveCompositeLoss(nn.Module):
         super(SuperAdaptiveCompositeLoss, self).__init__()
         self.num_classes = num_classes
         self.device = device
+        # 可学习的超参数 - 全自动调整
         self.gamma = nn.Parameter(torch.tensor(float(initial_gamma), requires_grad=True))
         self.alpha = nn.Parameter(torch.tensor(float(initial_alpha), requires_grad=True))
-        self.register_buffer('class_counts', torch.ones(num_classes, device=device))
-        self.register_buffer('class_losses', torch.zeros(num_classes, device=device))
-        self.register_buffer('sample_difficulties', torch.ones(10000, device=device))
+
+        # 在线统计参数 - 确保在正确的设备上
+        self.register_buffer('class_counts', torch.ones(num_classes, device=device))  # 移到指定设备
+        self.register_buffer('class_losses', torch.zeros(num_classes, device=device))  # 移到指定设备
+        self.register_buffer('sample_difficulties', torch.ones(10000, device=device))  # 移到指定设备
         self.sample_idx_counter = 0
+
+        # 自适应标签平滑参数
         self.label_smoothing = nn.Parameter(torch.tensor(0.1, requires_grad=True))
-        self.register_buffer('running_loss_mean', torch.tensor(0.0, device=device))
-        self.register_buffer('running_loss_std', torch.tensor(1.0, device=device))
+
+        # 梯度加权相关参数
+        self.register_buffer('running_loss_mean', torch.tensor(0.0, device=device))  # 移到指定设备
+        self.register_buffer('running_loss_std', torch.tensor(1.0, device=device))  # 移到指定设备
 
         # --- 新增：动态调整内部损失组件权重 ---
         self.focal_weight = nn.Parameter(torch.tensor(0.7, requires_grad=True))  # 权重焦点损失
@@ -51,88 +56,135 @@ class SuperAdaptiveCompositeLoss(nn.Module):
         print(f"📊 新增初始参数: focal_weight=0.7, smooth_weight=0.3")
 
     def update_statistics(self, inputs, targets):
+        """更新各类统计信息用于自适应调整"""
         with torch.no_grad():
+            # 确保targets在正确设备上
             targets = targets.to(self.device)
+            # 计算预测概率
             probs = F.softmax(inputs, dim=1)
             correct_probs = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+            # 更新类别统计
             for cls in range(self.num_classes):
                 cls_mask = (targets == cls)
                 if cls_mask.any():
                     cls_probs = correct_probs[cls_mask]
-                    if cls_probs.numel() > 0:
+                    if cls_probs.numel() > 0:  # 确保有元素
                         self.class_losses[cls] = self.class_losses[cls] * 0.9 + cls_probs.mean() * 0.1
                         self.class_counts[cls] = self.class_counts[cls] + cls_mask.sum()
-            difficulties = 1.0 - correct_probs
+
+            # 更新样本难度统计
+            difficulties = 1.0 - correct_probs  # 难度 = 1 - 正确概率
             for diff in difficulties:
                 if self.sample_idx_counter < len(self.sample_difficulties):
                     self.sample_difficulties[self.sample_idx_counter] = diff
                     self.sample_idx_counter += 1
                 else:
+                    # 循环覆盖旧的难度值
                     self.sample_idx_counter = 0
                     self.sample_difficulties[self.sample_idx_counter] = diff
                     self.sample_idx_counter += 1
 
     def adaptive_focal_factor(self, probs_for_gt_class):
+        """计算自适应焦点因子"""
+        # 基于全局统计动态调整gamma
         current_gamma = torch.clamp(self.gamma, 0.5, 5.0)
+        # 计算焦点权重
         focal_weight = (1.0 - probs_for_gt_class) ** current_gamma
+
+        # 基于样本难度进一步调整
         if self.sample_idx_counter > 0:
             mean_difficulty = self.sample_difficulties[:self.sample_idx_counter].mean()
         else:
             mean_difficulty = torch.tensor(0.5, device=self.device)
-        difficulty_adjustment = 1.0 + 0.5 * torch.tanh(mean_difficulty - 0.5)
+        difficulty_adjustment = 1.0 + 0.5 * torch.tanh(mean_difficulty - 0.5)  # 基于平均难度调整
+
         return focal_weight * difficulty_adjustment
 
     def adaptive_class_weights(self):
+        """计算自适应类别权重"""
+        # 基于类别频率和表现计算权重
         freq_weights = 1.0 / torch.sqrt(self.class_counts)
-        perf_weights = 1.0 / (self.class_losses + 1e-8)
+        perf_weights = 1.0 / (self.class_losses + 1e-8)  # 基于类别损失的倒数
+
+        # 归一化
         weights = freq_weights * perf_weights
-        weights = weights / weights.mean()
-        return torch.clamp(weights, 0.1, 10.0)
+        weights = weights / weights.mean()  # 确保平均权重为1
+        return torch.clamp(weights, 0.1, 10.0)  # 限制权重范围防止极端值
 
     def adaptive_label_smoothing(self):
+        """自适应标签平滑"""
+        # 基于训练进度动态调整标签平滑
         current_ls = torch.clamp(self.label_smoothing, 0.01, 0.3)
         return current_ls
 
     def forward(self, inputs, targets):
-        import torch.nn.functional as F  # 避免循环导入
+        # 确保targets在正确设备上
         targets = targets.to(self.device)
+
+        # 更新统计信息
         self.update_statistics(inputs, targets)
+
+        # 计算基础交叉熵损失
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+
+        # 计算预测概率
         log_probs = F.log_softmax(inputs, dim=1)
         probs = torch.exp(log_probs)
+
+        # 获取真实类别的概率
         probs_for_gt_class = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+        # 应用自适应焦点损失
         focal_factor = self.adaptive_focal_factor(probs_for_gt_class)
         focal_loss = focal_factor * ce_loss
+
+        # 计算自适应类别权重
         class_weights = self.adaptive_class_weights()
-        sample_weights = class_weights[targets]
+        sample_weights = class_weights[targets]  # targets现在与class_weights在同设备上
+
+        # 应用类别权重
         weighted_focal_loss = sample_weights * focal_loss
+
+        # 自适应标签平滑
         ls = self.adaptive_label_smoothing()
+        # 构建平滑标签 - 修复：将Tensor转换为标量
         smooth_labels = torch.full_like(inputs, ls.item() / (self.num_classes - 1), device=self.device)
         smooth_labels.scatter_(1, targets.unsqueeze(1), 1.0 - ls.item())
+        # 计算平滑标签的损失
         smooth_ce_loss = -(smooth_labels * log_probs).sum(dim=1)
 
         # --- 修改：使用可学习的权重组合内部损失 ---
         current_focal_w = torch.sigmoid(self.focal_weight)  # 使用sigmoid确保权重在0-1之间且可导
         current_smooth_w = torch.sigmoid(self.smooth_weight)
+        # 归一化权重，使其和为1 (可选，取决于设计意图，这里暂不强制归一化)
         # normalized_focal_w = current_focal_w / (current_focal_w + current_smooth_w)
         # normalized_smooth_w = current_smooth_w / (current_focal_w + current_smooth_w)
 
         combined_internal_loss = current_focal_w * weighted_focal_loss + current_smooth_w * smooth_ce_loss
 
+        # 梯度加权 - 基于样本难度
         with torch.no_grad():
             running_mean = self.running_loss_mean
             running_std = self.running_loss_std
+            # 更新运行统计
             batch_mean = combined_internal_loss.mean()
             batch_var = ((combined_internal_loss - batch_mean) ** 2).mean()
             self.running_loss_mean = 0.9 * running_mean + 0.1 * batch_mean
             self.running_loss_std = 0.9 * running_std + 0.1 * torch.sqrt(batch_var + 1e-8)
-        standardized_losses = (combined_internal_loss - self.running_loss_mean) / (self.running_loss_std + 1e-8)
-        gradient_weights = torch.exp(torch.clamp(standardized_losses, -2, 2) * 0.5)
+
+            # 基于相对于历史损失的偏离程度进行加权
+            standardized_losses = (combined_internal_loss - self.running_loss_mean) / (self.running_loss_std + 1e-8)
+            gradient_weights = torch.exp(torch.clamp(standardized_losses, -2, 2) * 0.5)
+
+        # 最终损失
         final_loss = (gradient_weights * combined_internal_loss).mean()
         return final_loss
 
 
+# 辅助函数：打印损失函数状态
 def print_loss_status(loss_fn):
+    """打印损失函数的当前状态"""
     gamma_val = loss_fn.gamma.item()
     alpha_val = loss_fn.alpha.item()
     ls_val = loss_fn.label_smoothing.item()
@@ -171,153 +223,30 @@ def get_model(model_name, config):
         raise ValueError(f"不支持的模型：{model_name}")
 
 
-def list_available_weights(models_dir="trained_models"):
-    os.makedirs(models_dir, exist_ok=True)
-    weight_files = []
-    for model_name in CONFIG["all_model_names"]:
-        standard_path = os.path.join(models_dir, f"{model_name}.pth")
-        if os.path.exists(standard_path):
-            weight_files.append(standard_path)
-        best_path = os.path.join(models_dir, f"best_{model_name}_model.pth")
-        if os.path.exists(best_path):
-            weight_files.append(best_path)
-    return weight_files
+def adjust_batch_size(epoch, initial_batch_size, batch_size_increase_factor, max_batch_size):
+    new_batch_size = initial_batch_size * (batch_size_increase_factor ** epoch)
+    return int(min(new_batch_size, max_batch_size))
 
 
-def infer_model_name_from_path(path):
-    filename = os.path.basename(path)
-    for model_name in CONFIG["all_model_names"]:
-        if f"{model_name}.pth" in filename or f"best_{model_name}_model.pth" in filename:
-            return model_name
-    return None
-
-
-def select_weights_and_model():
-    print("\n" + "=" * 60)
-    print("📂 选择预训练权重文件 (用于再次训练)")
-    print("=" * 60)
-    weight_files = list_available_weights()
-    if not weight_files:
-        print("⚠️ 没有在 'trained_models' 目录下找到可用的权重文件")
-        return None, None
-
-    valid_options = []
-    for idx, file_path in enumerate(weight_files):
-        relative_path = os.path.relpath(file_path, start=os.getcwd())
-        file_size = os.path.getsize(file_path) / (1024 * 1024)
-        inferred_model = infer_model_name_from_path(file_path)
-        status = f" (模型: {inferred_model.upper()})" if inferred_model else " (无法识别模型)"
-        if inferred_model:
-            print(f"{idx + 1}. {relative_path} ({file_size:.2f} MB){status}")
-            valid_options.append((file_path, inferred_model))
-        else:
-            print(f"❌ {relative_path} ({file_size:.2f} MB){status}")
-
-    print(f"{len(valid_options) + 1}. 退出")
-    print("=" * 60)
-
-    while True:
-        try:
-            choice = input(f"\n请选择权重文件序号 (1-{len(valid_options)}) 或按 'q' 退出: ").strip().lower()
-            if choice == 'q':
-                print("👋 退出程序")
-                sys.exit(0)
-            if not choice.isdigit():
-                print("⚠️ 请输入数字序号或 'q'")
-                continue
-            choice = int(choice)
-            if 1 <= choice <= len(valid_options):
-                selected_path, selected_model = valid_options[choice - 1]
-                print(f"\n✅ 已选择权重文件: {os.path.relpath(selected_path, start=os.getcwd())}")
-                print(f"✅ 推断模型名称: {selected_model.upper()}")
-                return selected_path, selected_model
-            else:
-                print(f"⚠️ 无效序号，请输入1-{len(valid_options)}之间的数字")
-        except KeyboardInterrupt:
-            print("\n👋 程序中断")
-            sys.exit(0)
-        except Exception as e:
-            print(f"⚠️ 错误: {str(e)}")
-
-
-def load_model_from_weights(model, weights_path, config):
-    if weights_path is None:
-        print("🔄 从头开始初始化模型 (不推荐用于再次训练)")
-        return model, None, 0, 0.0
-
-    try:
-        print(f"📥 正在加载权重文件: {weights_path}")
-        checkpoint = torch.load(weights_path, map_location=config["device"], weights_only=False)
-        if isinstance(checkpoint, dict):
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-                start_epoch = checkpoint.get('epoch', 0)
-                optimizer_state = checkpoint.get('optimizer_state_dict')
-                f1_score_value = checkpoint.get('f1_score', 0.0)
-                print(f"✅ 成功加载模型权重，起始轮次: {start_epoch}, F1分数: {f1_score_value:.4f}")
-                return model, optimizer_state, start_epoch, f1_score_value
-            else:
-                model.load_state_dict(checkpoint)
-                print("✅ 成功加载模型权重，起始轮次: 0, F1分数未知 (设为0.0)")
-                return model, None, 0, 0.0
-        else:
-            model.load_state_dict(checkpoint)
-            print("✅ 成功加载模型权重，起始轮次: 0, F1分数未知 (设为0.0)")
-            return model, None, 0, 0.0
-    except RuntimeError as e:
-        if "size" in str(e):
-            print(f"❌ 加载模型权重失败 (可能是模型不匹配): {str(e)}")
-        else:
-            print(f"❌ 加载模型权重失败: {str(e)}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"❌ 加载权重失败: {str(e)}")
-        sys.exit(1)
-
-
-def calculate_per_class_accuracy(all_targets, all_preds, num_classes=3):
-    """ 计算每个类别的准确率。 """
-    all_targets = np.array(all_targets)
-    all_preds = np.array(all_preds)
-    class_accuracies = {}
-    for i in range(num_classes):
-        class_mask = (all_targets == i)
-        if np.sum(class_mask) == 0:
-            # 如果该类别在验证集中没有样本，则准确率为 NaN 或 0
-            class_accuracies[i] = float('nan')
-        else:
-            class_correct = (all_preds[class_mask] == all_targets[class_mask]).sum()
-            class_total = class_mask.sum()
-            class_accuracies[i] = class_correct / class_total
-    return class_accuracies
-
-
-def train_model(model, model_name, train_loader, val_loader, criterion, optimizer, scheduler, config, start_epoch=0,
-                initial_f1=0.0):
-    best_f1_score = initial_f1  # 修改：保存路径指向新的文件夹
-    best_model_path = os.path.join("trained_models_again", f"best_{model_name}_again_model.pth")
-    os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
+def train_model(model, model_name, train_loader, val_loader, criterion, optimizer, scheduler, config):
+    best_val_loss = float('inf')
+    best_val_acc = 0.0
+    best_f1_score = 0.0  # 用于保存最佳模型的关键指标
+    # 根据 model_name 动态构建 best_model_path
+    best_model_path = os.path.join(os.path.dirname(config["model_paths"][model_name]), f"best_{model_name}_model.pth")
 
     patience = config["patience"]
     epochs_without_improvement = 0
-    total_epochs = start_epoch + config["epochs"]
-    f1_history = [initial_f1]  # Assuming class names are fixed, you can modify this mapping based on your config
-    # 从配置中获取类别名，如果不存在则使用默认值
-    class_names_map = getattr(CONFIG, 'class_names', {0: '类别0', 1: '类别1', 2: '类别2'})
-    # For the fruit example, assuming 0: 好果, 1: 次果, 2: 烂果
-    # You can define this more robustly in your config if needed
-    class_names = {0: '好果', 1: '次果', 2: '烂果'}  # Default names for 3 classes
 
-    for epoch in range(start_epoch, total_epochs):
-        current_epoch = epoch - start_epoch + 1
+    for epoch in range(config["epochs"]):
         start_time = time.time()
         model.train()
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
 
-        print(f"\nEpoch {current_epoch}/{config['epochs']}")
-        pbar = tqdm(train_loader, desc=f"训练 Epoch {current_epoch}/{config['epochs']}", ncols=120)
+        print(f"\nEpoch {epoch + 1}/{config['epochs']} | 当前批量大小: {train_loader.batch_size}")
+        pbar = tqdm(train_loader, desc=f"训练 Epoch {epoch + 1}/{config['epochs']}", ncols=120)
         for batch_idx, (data, targets) in enumerate(pbar):
             data = data.to(config["device"])
             targets = targets.to(config["device"])
@@ -327,7 +256,7 @@ def train_model(model, model_name, train_loader, val_loader, criterion, optimize
             loss = criterion(outputs, targets)
             loss.backward()
 
-            # 性能优化：增加梯度裁剪阈值，提高稳定性
+            # --- 性能优化：增加梯度裁剪阈值 ---
             torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(criterion.parameters()), max_norm=2.0)
 
             optimizer.step()
@@ -345,15 +274,16 @@ def train_model(model, model_name, train_loader, val_loader, criterion, optimize
         avg_train_loss = total_loss / total_samples
         avg_train_acc = total_correct / total_samples
 
+        # 验证阶段
         model.eval()
         val_loss = 0.0
         val_correct = 0
         val_samples = 0
-        all_preds = []
-        all_targets = []
+        class_correct = [0] * config["num_classes"]
+        class_total = [0] * config["num_classes"]
 
         with torch.no_grad():
-            val_pbar = tqdm(val_loader, desc=f"验证 Epoch {current_epoch}/{config['epochs']}", ncols=120)
+            val_pbar = tqdm(val_loader, desc=f"验证 Epoch {epoch + 1}/{config['epochs']}", ncols=120)
             for batch_idx, (data, targets) in enumerate(val_pbar):
                 data = data.to(config["device"])
                 targets = targets.to(config["device"])
@@ -364,8 +294,11 @@ def train_model(model, model_name, train_loader, val_loader, criterion, optimize
                 _, preds = torch.max(outputs, 1)
                 val_correct += (preds == targets).sum().item()
                 val_samples += data.size(0)
-                all_preds.extend(preds.cpu().numpy())
-                all_targets.extend(targets.cpu().numpy())
+
+                # 计算每个类别的准确率
+                for t, p in zip(targets.view(-1), preds.view(-1)):
+                    class_correct[t] += p.eq(t).item()
+                    class_total[t] += 1
 
             val_pbar.set_postfix({
                 '平均损失': f"{val_loss / val_samples:.4f}",
@@ -374,42 +307,41 @@ def train_model(model, model_name, train_loader, val_loader, criterion, optimize
 
         avg_val_loss = val_loss / val_samples
         avg_val_acc = val_correct / val_samples
+        class_accuracies = [class_correct[i] / class_total[i] if class_total[i] != 0 else 0 for i in
+                            range(config["num_classes"])]
+        avg_class_accuracy = sum(class_accuracies) / len(class_accuracies)
 
-        # Calculate macro F1 score
+        # 计算F1分数
+        from sklearn.metrics import f1_score
+        all_preds = []
+        all_targets = []
+        with torch.no_grad():
+            for batch_idx, (data, targets) in enumerate(val_loader):
+                data = data.to(config["device"])
+                targets = targets.to(config["device"])
+                outputs = model(data)
+                _, preds = torch.max(outputs, 1)
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(targets.cpu().numpy())
+
         f1_score_macro = f1_score(all_targets, all_preds, average='macro')
-        f1_history.append(f1_score_macro)
-
-        # Calculate per-class accuracy
-        per_class_accs = calculate_per_class_accuracy(all_targets, all_preds, num_classes=CONFIG["num_classes"])
-
-        # Prepare string for per-class accuracies
-        acc_strings = []
-        total_valid_classes = 0
-        sum_valid_accuracies = 0.0
-        for i in range(CONFIG["num_classes"]):
-            name = class_names.get(i, f"Class_{i}")
-            acc = per_class_accs[i]
-            if not np.isnan(acc):
-                acc_strings.append(f"{name}: {acc:.4f}")
-                sum_valid_accuracies += acc
-                total_valid_classes += 1
-            else:
-                acc_strings.append(f"{name}: N/A")  # Handle case where class has no samples in validation set
-
-        avg_per_class_acc = sum_valid_accuracies / total_valid_classes if total_valid_classes > 0 else float('nan')
 
         print(f"验证 | 损失: {avg_val_loss:.4f} | 准确率: {avg_val_acc:.4f} | F1: {f1_score_macro:.4f}")
-        print(f"验证类别准确率 | {' | '.join(acc_strings)} | 平均: {avg_per_class_acc:.4f}")
-        print(f"最佳 | F1: {best_f1_score:.4f}")
+        print(
+            f"验证类别准确率 | {config['class_names'][0]}: {class_accuracies[0]:.4f} | {config['class_names'][1]}: {class_accuracies[1]:.4f} | {config['class_names'][2]}: {class_accuracies[2]:.4f} | 平均: {avg_class_accuracy:.4f}")
+        print(f"最佳 | 准确率: {best_val_acc:.4f} | F1: {best_f1_score:.4f}")
         print(f"学习率: {scheduler.get_last_lr()[0]:.6f}")  # 修改：使用 get_last_lr()
 
+        # 打印SACL状态
         if isinstance(criterion, SuperAdaptiveCompositeLoss):
             print_loss_status(criterion)
 
-        # 修改：保存信息，包含轮次和F1分数
-        if f1_score_macro > best_f1_score:
+        if f1_score_macro > best_f1_score:  # 注意：F1分数是越大越好
             best_f1_score = f1_score_macro
+            best_val_loss = avg_val_loss
+            best_val_acc = avg_val_acc
             epochs_without_improvement = 0
+
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
@@ -420,21 +352,21 @@ def train_model(model, model_name, train_loader, val_loader, criterion, optimize
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
-                print(f"⚠️ Early Stopping: 连续 {patience} 个 epoch 宏F1分数未提升，停止训练")
+                print(f"⚠️ Early Stopping: 连续 {patience} 个 epoch Macro F1 未提升，停止训练")
                 break
 
         # --- 修改：调度器现在使用 CosineAnnealingLR ---
         scheduler.step()  # CosineAnnealingLR 不需要传入指标
 
         end_time = time.time()
-        print(f"Epoch {current_epoch}/{config['epochs']} | 耗时: {end_time - start_time:.1f}s")
+        print(f"Epoch {epoch + 1}/{config['epochs']} | 耗时: {end_time - start_time:.1f}s")
 
-    return best_model_path, best_f1_score
+    return best_model_path
 
 
 def main():
     print("=" * 80)
-    print("🍎 再次训练水果分类模型 (性能优化版)")
+    print("🍎 训练水果分类模型")
     print("=" * 80)
     print(f"📁 数据集: {CONFIG['train_data_dir']}")
     print(f"🔧 设备: {CONFIG['device'].upper()}")
@@ -442,20 +374,50 @@ def main():
 
     start_time = time.time()
 
-    weights_file, model_name = select_weights_and_model()
-    if weights_file is None or model_name is None:
-        print("❌ 未选择有效的模型和权重文件，程序退出。")
-        return
+    # 创建报告目录
+    os.makedirs(CONFIG["report_dir"], exist_ok=True)
 
-    print("\n[1/4] 加载数据集...")
+    # 选择模型
+    print("\n" + "=" * 60)
+    print("📌 模型选择界面")
+    print("=" * 60)
+    for idx, name in enumerate(CONFIG["all_model_names"]):
+        print(f"{idx + 1}. {name.upper()}")
+    print(f"{len(CONFIG['all_model_names']) + 1}. 退出")
+    print("=" * 60)
+
+    while True:
+        try:
+            choice = input("\n请选择模型序号: ").strip()
+            if not choice.isdigit():
+                print("⚠️ 请输入数字序号")
+                continue
+            choice = int(choice)
+            if choice == len(CONFIG["all_model_names"]) + 1:
+                print("👋 退出程序")
+                sys.exit(0)
+            elif 1 <= choice <= len(CONFIG["all_model_names"]):
+                model_name = CONFIG["all_model_names"][choice - 1]
+                print(f"\n✅ 已选择: {model_name.upper()}")
+                break
+            else:
+                print(f"⚠️ 无效序号，请输入1-{len(CONFIG['all_model_names']) + 1}之间的数字")
+        except KeyboardInterrupt:
+            print("\n👋 程序中断")
+            sys.exit(0)
+        except ValueError:
+            print("⚠️ 请输入有效数字")
+
+    # 加载数据集
+    print("\n[1/3] 加载数据集...")
     train_dataset = FruitVideoDataset(
         data_dir=CONFIG["train_data_dir"],
         model_name=model_name,
         num_frames=CONFIG["num_frames"],
         input_size=CONFIG["input_size"],
         train=True,
-        augment=True,
-        target_count=CONFIG["target_count"]
+        augment=True,  # 启用数据增强
+        target_count=CONFIG["target_count"]  # 使用配置中的目标数量
     )
     val_dataset = FruitVideoDataset(
         data_dir=CONFIG["val_data_dir"],
@@ -469,9 +431,10 @@ def main():
         print("❌ 错误：数据集为空，请检查路径")
         sys.exit(1)
 
+    # 数据加载器
     train_loader = DataLoader(
         train_dataset,
-        batch_size=CONFIG["batch_size"],
+        batch_size=CONFIG["initial_batch_size"],  # 初始批量大小
         shuffle=True,
         num_workers=CONFIG["num_workers"],
         pin_memory=True
@@ -484,52 +447,45 @@ def main():
         pin_memory=True
     )
 
-    print("\n[2/4] 加载模型架构...")
+    # 加载模型
+    print("\n[2/3] 加载模型...")
     model = get_model(model_name, CONFIG)
     model.to(CONFIG["device"])
 
-    print("\n[3/4] 加载预训练权重...")
-    model, optimizer_state, start_epoch, initial_f1 = load_model_from_weights(model, weights_file, CONFIG)
-
-    print("\n[3.5/4] 初始化超级自适应复合损失函数 (SACL)...")
+    # ===== 修改：使用超级自适应复合损失函数 (修复设备问题) =====
+    print("\n[2.5/3] 初始化超级自适应复合损失函数 (SACL)...")
     criterion = SuperAdaptiveCompositeLoss(
         num_classes=CONFIG["num_classes"],
-        device=CONFIG["device"],
+        device=CONFIG["device"],  # 明确指定设备
         initial_gamma=2.0,
         initial_alpha=1.0
     )
+    # 将损失函数也移到设备上
     criterion.to(CONFIG["device"])
 
-    print("\n[4/4] 设置优化器...")
-    # 性能优化：使用更大的梯度裁剪阈值，并确保优化器同时管理模型和损失函数的参数
+    # --- 优化器 - 使用AdamW并管理模型和损失函数参数 ---
     optimizer = optim.AdamW(
-        list(model.parameters()) + list(criterion.parameters()),
+        list(model.parameters()) + list(criterion.parameters()),  # 优化模型和损失函数参数
         lr=CONFIG["learning_rate"],
         weight_decay=1e-4
     )
 
-    # 尝试加载优化器状态
-    if optimizer_state is not None:
-        try:
-            optimizer.load_state_dict(optimizer_state)
-            print("✅ 成功加载优化器状态")
-        except Exception as e:
-            print(
-                f"⚠️ 加载优化器状态失败: {str(e)}，这可能是因为模型结构不同、损失函数结构不同或优化器类型不同。将使用新的优化器状态。")
-            print("💡 提示: 如果是从完全不同的模型或损失函数迁移过来，请确保模型名称和训练方式匹配。")
+    # --- 调度器: 修改为 CosineAnnealingLR ---
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=CONFIG["epochs"],  # 整个训练周期
+        eta_min=1e-6  # 最小学习率
+    )
 
-    # 性能优化：使用CosineAnnealingLR调度器，提供更平滑的学习率衰减
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"], eta_min=1e-6)
-
-    print(f"\n🚀 开始在 '{model_name.upper()}' 模型上再次训练...")
-    best_model_path, final_best_f1 = train_model(model, model_name, train_loader, val_loader, criterion, optimizer,
-                                                 scheduler, CONFIG, start_epoch, initial_f1)
+    # 训练模型
+    print("\n[3/3] 开始训练...")
+    best_model_path = train_model(model, model_name, train_loader, val_loader, criterion, optimizer, scheduler, CONFIG)
 
     total_time = time.time() - start_time
     print(f"\n{'=' * 80}")
-    print(f"✅ 再次训练完成！总耗时: {total_time:.1f}秒")
-    print(f"最终最佳宏F1分数: {final_best_f1:.4f}")
-    print(f"最佳模型已保存至: {best_model_path}")
+    print(f"✅ 训练完成！总耗时: {total_time:.1f}秒")
+    print(f"最佳模型路径: {best_model_path}")
+    print(f"报告保存路径: {CONFIG['report_dir']}")
     print(f"{'=' * 80}")
 
 
