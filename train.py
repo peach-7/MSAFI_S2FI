@@ -11,7 +11,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-from sklearn.metrics import f1_score, precision_score, recall_score, classification_report, confusion_matrix
+from sklearn.metrics import (f1_score, precision_score, recall_score,
+                             classification_report, confusion_matrix)
 
 from config import CONFIG
 from utils.data_processing import FruitVideoDataset
@@ -46,10 +47,10 @@ def print_model_parameters(model: nn.Module, model_name: str) -> dict:
     """Print and return parameter statistics for a model."""
     info = count_model_parameters(model)
     print(f"\n[PARAMS] {model_name.upper()}")
-    print(f"  Total:        {info['total_params']:,}")
-    print(f"  Trainable:    {info['trainable_params']:,}")
-    print(f"  Non-trainable:{info['non_trainable_params']:,}")
-    print(f"  Size (MB):    {info['model_size_mb']:.2f}")
+    print(f"  Total:         {info['total_params']:,}")
+    print(f"  Trainable:     {info['trainable_params']:,}")
+    print(f"  Non-trainable: {info['non_trainable_params']:,}")
+    print(f"  Size (MB):     {info['model_size_mb']:.2f}")
     return info
 
 
@@ -78,8 +79,6 @@ def calculate_comprehensive_metrics(all_targets, all_preds, class_names):
         else:
             class_accuracies[name] = 0.0
 
-    cm = confusion_matrix(all_targets, all_preds)
-
     return {
         'accuracy': accuracy,
         'f1_macro': f1_macro,
@@ -91,24 +90,24 @@ def calculate_comprehensive_metrics(all_targets, all_preds, class_names):
         'recall_weighted': recall_weighted,
         'class_accuracies': class_accuracies,
         'classification_report': report,
-        'confusion_matrix': cm,
+        'confusion_matrix': confusion_matrix(all_targets, all_preds),
         'class_names': class_names,
     }
 
 
 def print_comprehensive_metrics(metrics: dict, model_name: str, epoch: int = None):
-    """Print formatted evaluation metrics."""
+    """Print formatted evaluation metrics to stdout."""
     header = f"[EVAL] {model_name.upper()}"
     if epoch is not None:
         header += f" - Epoch {epoch}"
     print(f"\n{'=' * 70}")
     print(header)
     print(f"{'=' * 70}")
-    print(f"  Accuracy:       {metrics['accuracy']:.4f}")
-    print(f"  Macro F1:       {metrics['f1_macro']:.4f}")
-    print(f"  Weighted F1:    {metrics['f1_weighted']:.4f}")
-    print(f"  Macro Precision:{metrics['precision_macro']:.4f}")
-    print(f"  Macro Recall:   {metrics['recall_macro']:.4f}")
+    print(f"  Accuracy:        {metrics['accuracy']:.4f}")
+    print(f"  Macro F1:        {metrics['f1_macro']:.4f}")
+    print(f"  Weighted F1:     {metrics['f1_weighted']:.4f}")
+    print(f"  Macro Precision: {metrics['precision_macro']:.4f}")
+    print(f"  Macro Recall:    {metrics['recall_macro']:.4f}")
 
     report = metrics['classification_report']
     for cls in metrics['class_names']:
@@ -120,11 +119,17 @@ def print_comprehensive_metrics(metrics: dict, model_name: str, epoch: int = Non
 
 
 class SuperAdaptiveCompositeLoss(nn.Module):
-    """
-    SACL: Super Adaptive Composite Loss for imbalanced datasets.
+    """SACL: Super Adaptive Composite Loss for imbalanced datasets.
 
     Combines focal loss with adaptive class weighting and label smoothing.
-    All key hyper-parameters are learnable.
+    All key hyper-parameters are learnable and adjusted during training.
+
+    Args:
+        num_classes: Number of target classes.
+        device: Target device string.
+        initial_gamma: Starting value for the focal loss exponent.
+        initial_alpha: Starting value for class-weight blending factor.
+        class_weights: Optional manual class weight list.
     """
 
     def __init__(self, num_classes: int = 3, device: str = 'cuda',
@@ -159,6 +164,7 @@ class SuperAdaptiveCompositeLoss(nn.Module):
         self._sample_idx = 0
 
     def update_statistics(self, inputs: torch.Tensor, targets: torch.Tensor):
+        """Update online class-frequency and difficulty statistics."""
         with torch.no_grad():
             targets = targets.to(self.device)
             probs = F.softmax(inputs, dim=1)
@@ -177,6 +183,7 @@ class SuperAdaptiveCompositeLoss(nn.Module):
                     self._sample_idx = 0
 
     def adaptive_focal_factor(self, probs_gt: torch.Tensor) -> torch.Tensor:
+        """Compute difficulty-aware focal scaling factor."""
         gamma = torch.clamp(self.gamma, 0.5, 5.0)
         focal = (1.0 - probs_gt) ** gamma
         if self._sample_idx > 0:
@@ -187,6 +194,7 @@ class SuperAdaptiveCompositeLoss(nn.Module):
         return focal * adj
 
     def adaptive_class_weights(self) -> torch.Tensor:
+        """Compute class weights blending frequency, performance, and manual priors."""
         freq_w = 1.0 / torch.sqrt(self.class_counts)
         perf_w = 1.0 / (self.class_losses + 1e-8)
         weights = freq_w * perf_w
@@ -196,6 +204,15 @@ class SuperAdaptiveCompositeLoss(nn.Module):
         return torch.clamp(combined, 0.1, 50.0)
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute the composite loss value.
+
+        Args:
+            inputs: Raw logits of shape (N, C).
+            targets: Ground-truth class indices of shape (N,).
+
+        Returns:
+            Scalar loss tensor.
+        """
         targets = targets.to(self.device)
         self.update_statistics(inputs, targets)
 
@@ -230,7 +247,18 @@ class SuperAdaptiveCompositeLoss(nn.Module):
 
 
 def get_model(model_name: str, config: dict) -> nn.Module:
-    """Instantiate a model by name from the configuration registry."""
+    """Instantiate a model by name from the configuration registry.
+
+    Args:
+        model_name: One of the keys in config['all_model_names'].
+        config: Global configuration dictionary.
+
+    Returns:
+        Instantiated nn.Module on CPU.
+
+    Raises:
+        ValueError: If model_name is not registered.
+    """
     nc = config["num_classes"]
     nf = config["num_frames"]
     isz = config["input_size"]
@@ -256,7 +284,11 @@ def get_model(model_name: str, config: dict) -> nn.Module:
 def train_model(model: nn.Module, model_name: str, train_loader: DataLoader,
                 val_loader: DataLoader, criterion: nn.Module, optimizer: optim.Optimizer,
                 scheduler: optim.lr_scheduler._LRScheduler, config: dict) -> str:
-    """Train model with mixed-precision and gradient accumulation. Returns best model path."""
+    """Train model with mixed-precision and gradient accumulation.
+
+    Returns:
+        File path of the saved best-model checkpoint.
+    """
     best_f1 = 0.0
     patience = config["patience"]
     no_improve = 0
@@ -277,7 +309,7 @@ def train_model(model: nn.Module, model_name: str, train_loader: DataLoader,
         total_loss, total_correct, total_samples = 0.0, 0, 0
         optimizer.zero_grad()
 
-        pbar = tqdm(train_loader, desc=f"Train {epoch+1}/{config['epochs']}", ncols=100)
+        pbar = tqdm(train_loader, desc=f"Train {epoch + 1}/{config['epochs']}", ncols=100)
         for batch_idx, (data, targets) in enumerate(pbar):
             data = data.to(config["device"])
             targets = targets.to(config["device"])
@@ -308,7 +340,6 @@ def train_model(model: nn.Module, model_name: str, train_loader: DataLoader,
                 'acc': f"{total_correct / total_samples:.4f}"
             })
 
-        # Handle incomplete last accumulation block
         if (batch_idx + 1) % grad_accum != 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
@@ -323,7 +354,7 @@ def train_model(model: nn.Module, model_name: str, train_loader: DataLoader,
         all_preds, all_targets = [], []
 
         with torch.no_grad():
-            for data, targets in tqdm(val_loader, desc=f"Val {epoch+1}/{config['epochs']}", ncols=100):
+            for data, targets in tqdm(val_loader, desc=f"Val {epoch + 1}/{config['epochs']}", ncols=100):
                 data = data.to(config["device"])
                 targets = targets.to(config["device"])
                 with autocast(enabled=use_amp):
@@ -339,7 +370,6 @@ def train_model(model: nn.Module, model_name: str, train_loader: DataLoader,
         metrics = calculate_comprehensive_metrics(all_targets, all_preds, config['class_names'])
         print_comprehensive_metrics(metrics, model_name, epoch + 1)
 
-        # Save best model based on Macro F1
         if metrics['f1_macro'] > best_f1:
             best_f1 = metrics['f1_macro']
             no_improve = 0
@@ -351,7 +381,7 @@ def train_model(model: nn.Module, model_name: str, train_loader: DataLoader,
                 'f1_score': metrics['f1_macro'],
                 'metrics': metrics,
             }, best_path)
-            print(f"[SAVE] Epoch {epoch+1} -> {best_path} (Macro F1: {best_f1:.4f})")
+            print(f"[SAVE] Epoch {epoch + 1} -> {best_path} (Macro F1: {best_f1:.4f})")
         else:
             no_improve += 1
             if no_improve >= patience:
@@ -360,7 +390,7 @@ def train_model(model: nn.Module, model_name: str, train_loader: DataLoader,
 
         scheduler.step()
         elapsed = time.time() - t0
-        print(f"Epoch {epoch+1} done in {elapsed:.1f}s")
+        print(f"Epoch {epoch + 1} done in {elapsed:.1f}s")
 
         if config["device"] == "cuda":
             mem = torch.cuda.memory_allocated() / 1024 ** 3
@@ -370,6 +400,7 @@ def train_model(model: nn.Module, model_name: str, train_loader: DataLoader,
 
 
 def main():
+    """Entry point for interactive model training."""
     print("=" * 70)
     print("Fruit Classification Training")
     print("=" * 70)
@@ -379,7 +410,6 @@ def main():
 
     os.makedirs(CONFIG["report_dir"], exist_ok=True)
 
-    # Model selection
     print("\nAvailable models:")
     for idx, name in enumerate(CONFIG["all_model_names"]):
         print(f"  {idx + 1}. {name}")
@@ -403,16 +433,23 @@ def main():
     # Load datasets
     print("\n[1/3] Loading datasets...")
     train_dataset = FruitVideoDataset(
-        data_dir=CONFIG["train_data_dir"], model_name=model_name,
-        num_frames=CONFIG["num_frames"], input_size=CONFIG["input_size"],
-        train=True, augment=True, target_count=CONFIG["target_count"],
-        use_weighted_sampling=True
+        data_dir=CONFIG["train_data_dir"],
+        model_name=model_name,
+        num_frames=CONFIG["num_frames"],
+        input_size=CONFIG["input_size"],
+        train=True,
+        augment=True,
+        target_count=CONFIG["target_count"]
     )
-    train_sampler = train_dataset.get_weighted_sampler()
 
+    train_sampler = None
+    if hasattr(train_dataset, 'get_weighted_sampler'):
+        train_sampler = train_dataset.get_weighted_sampler()
     val_dataset = FruitVideoDataset(
-        data_dir=CONFIG["val_data_dir"], model_name=model_name,
-        num_frames=CONFIG["num_frames"], input_size=CONFIG["input_size"],
+        data_dir=CONFIG["val_data_dir"],
+        model_name=model_name,
+        num_frames=CONFIG["num_frames"],
+        input_size=CONFIG["input_size"],
         train=False
     )
 
@@ -421,13 +458,19 @@ def main():
         sys.exit(1)
 
     train_loader = DataLoader(
-        train_dataset, batch_size=CONFIG["initial_batch_size"],
-        shuffle=(train_sampler is None), sampler=train_sampler,
-        num_workers=CONFIG["num_workers"], pin_memory=True
+        train_dataset,
+        batch_size=CONFIG["initial_batch_size"],
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=CONFIG["num_workers"],
+        pin_memory=True
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=CONFIG["batch_size"],
-        shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True
+        val_dataset,
+        batch_size=CONFIG["batch_size"],
+        shuffle=False,
+        num_workers=CONFIG["num_workers"],
+        pin_memory=True
     )
 
     # Build model
@@ -438,14 +481,17 @@ def main():
 
     # Loss, optimizer, scheduler
     criterion = SuperAdaptiveCompositeLoss(
-        num_classes=CONFIG["num_classes"], device=CONFIG["device"],
-        initial_gamma=2.0, initial_alpha=1.0,
+        num_classes=CONFIG["num_classes"],
+        device=CONFIG["device"],
+        initial_gamma=2.0,
+        initial_alpha=1.0,
         class_weights=CONFIG["class_weights"]
     ).to(CONFIG["device"])
 
     optimizer = optim.AdamW(
         list(model.parameters()) + list(criterion.parameters()),
-        lr=CONFIG["learning_rate"], weight_decay=1e-4
+        lr=CONFIG["learning_rate"],
+        weight_decay=1e-4
     )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=CONFIG["epochs"], eta_min=1e-6
@@ -454,8 +500,10 @@ def main():
     # Train
     print("\n[3/3] Training...")
     t0 = time.time()
-    best_path = train_model(model, model_name, train_loader, val_loader,
-                            criterion, optimizer, scheduler, CONFIG)
+    best_path = train_model(
+        model, model_name, train_loader, val_loader,
+        criterion, optimizer, scheduler, CONFIG
+    )
 
     elapsed = time.time() - t0
     info = count_model_parameters(model)
